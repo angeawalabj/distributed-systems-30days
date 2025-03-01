@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package produit;
+
+// ─── MESSAGES ────────────────────────────────────────────────────────────────
+
+message Produit {
+  string id         = 1;
+  string nom        = 2;
+  float  prix       = 3;
+  int32  stock      = 4;
+  string categorie  = 5;
+}
+
+message ProduitRequest {
+  string id = 1;
+}
+
+message ListeRequest {
+  string categorie = 1;  // filtre optionnel
+  int32  limite    = 2;
+}
+
+message ListeResponse {
+  repeated Produit produits = 1;
+  int32            total    = 2;
+}
+
+message UpdateStockRequest {
+  string id       = 1;
+  int32  quantite = 2;  // positif = ajout, négatif = retrait
+}
+
+message UpdateStockResponse {
+  bool   succes         = 1;
+  string message        = 2;
+  int32  nouveau_stock  = 3;
+}
+
+// ─── SERVICE ─────────────────────────────────────────────────────────────────
+
+service ProduitService {
+  // Récupère un produit par son ID
+  rpc GetProduit (ProduitRequest) returns (Produit);
+
+  // Liste les produits (avec filtre optionnel par catégorie)
+  rpc ListeProduits (ListeRequest) returns (ListeResponse);
+
+  // Modifie le stock d'un produit (idempotent avec quantité)
+  rpc UpdateStock (UpdateStockRequest) returns (UpdateStockResponse);
+
+  // Stream : envoie les produits un par un (server-side streaming)
+  rpc StreamProduits (ListeRequest) returns (stream Produit);
+}
