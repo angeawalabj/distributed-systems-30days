@@ -1,0 +1,69 @@
+name: CI — Run all simulations
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  simulations:
+    name: Run simulations (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run all simulations
+        run: |
+          set -e
+          FAILED=0
+          for dir in jour*/; do
+            if [ -f "$dir/simulation.py" ]; then
+              echo "▶ $dir"
+              timeout 60 python3 "$dir/simulation.py" > /dev/null 2>&1 || {
+                echo "  ✗ FAILED: $dir"
+                FAILED=$((FAILED + 1))
+              }
+            fi
+          done
+          # Bonus
+          if [ -f "query-planner/simulation.py" ]; then
+            echo "▶ query-planner"
+            timeout 60 python3 query-planner/simulation.py > /dev/null 2>&1 || {
+              echo "  ✗ FAILED: query-planner"
+              FAILED=$((FAILED + 1))
+            }
+          fi
+          echo ""
+          echo "══════════════════════════════════"
+          if [ $FAILED -eq 0 ]; then
+            echo "  ✓ All simulations passed"
+          else
+            echo "  ✗ $FAILED simulation(s) failed"
+            exit 1
+          fi
+
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Run ruff
+        run: |
+          ruff check --select E,W,F --ignore E501,W291,W293 \
+            jour*/simulation.py jour*/*.py query-planner/*.py \
+            || true   # lint warnings non-bloquants pour ce repo pédagogique
