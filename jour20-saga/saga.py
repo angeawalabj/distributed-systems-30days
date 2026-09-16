@@ -43,11 +43,11 @@ from collections import defaultdict
 # ─── ÉTATS D'UNE SAGA ────────────────────────────────────────────────────────
 
 class EtatSaga(Enum):
-    EN_COURS     = "en_cours"
-    COMPLETEE    = "completee"
+    EN_COURS        = "en_cours"
+    SUCCES          = "succes"
+    ECHOUEE         = "echouee"         # Échec sans compensation nécessaire (rien n'avait réussi)
     EN_COMPENSATION = "en_compensation"
-    COMPENSEE    = "compensee"      # Rollback logique complet
-    ECHOUEE      = "echouee"        # Échec sans compensation possible
+    COMPENSEE       = "compensee"       # Échec avec compensations exécutées (rollback logique)
 
 
 # ─── BUS D'ÉVÉNEMENTS (simplifié) ────────────────────────────────────────────
@@ -61,12 +61,14 @@ class BusEvenements:
         self._handlers: dict[str, list[Callable]] = defaultdict(list)
         self._journal:  list[dict] = []
         self._lock      = threading.Lock()
+        self._derniere_activite = time.time()
 
     def publier(self, type_ev: str, payload: dict, source: str = ""):
         ev = {"id": uuid.uuid4().hex[:8], "type": type_ev,
-              "payload": payload, "source": source, "ts": time.time()}
+              "payload": payload, "emetteur": source, "ts": time.time()}
         with self._lock:
             self._journal.append(ev)
+            self._derniere_activite = time.time()
             handlers = list(self._handlers.get(type_ev, []))
         for h in handlers:
             threading.Thread(target=h, args=(ev,), daemon=True).start()
@@ -75,6 +77,17 @@ class BusEvenements:
         with self._lock:
             self._handlers[type_ev].append(handler)
 
+    def attendre_silence(self, timeout: float = 2.0, silence: float = 0.15):
+        """Bloque jusqu'à ce qu'aucun événement n'ait été publié depuis `silence` secondes."""
+        fin = time.time() + timeout
+        while time.time() < fin:
+            with self._lock:
+                derniere = self._derniere_activite
+            if time.time() - derniere > silence:
+                return
+            time.sleep(0.02)
+
+    @property
     def journal(self) -> list[dict]:
         with self._lock:
             return list(self._journal)
@@ -93,10 +106,10 @@ class ServiceSimule:
     """
     Simule un microservice avec latence, taux d'erreur et compensation.
     """
-    def __init__(self, nom: str, latence_ms: float = 50.0, taux_erreur: float = 0.0):
+    def __init__(self, nom: str, latence_ms: float = 50.0, taux_echec: float = 0.0):
         self.nom         = nom
         self.latence     = latence_ms / 1000
-        self.taux_erreur = taux_erreur
+        self.taux_echec  = taux_echec
         self._etat:  dict[str, Any] = {}   # état local du service (sa propre DB)
         self._lock   = threading.Lock()
         self.stats   = defaultdict(int)
@@ -105,7 +118,7 @@ class ServiceSimule:
                  forcer_erreur: bool = False) -> ResultatService:
         """Exécute une action locale (transaction locale)."""
         time.sleep(self.latence * random.uniform(0.8, 1.2))
-        if forcer_erreur or random.random() < self.taux_erreur:
+        if forcer_erreur or random.random() < self.taux_echec:
             self.stats["echecs"] += 1
             return ResultatService(False, erreur=f"{self.nom}: {commande} échoué")
         with self._lock:
@@ -126,7 +139,7 @@ class ServiceSimule:
 # PATTERN 1 : CHOREOGRAPHY
 # ════════════════════════════════════════════════════════════════
 
-class SagaChoreography:
+class SagaCommandeChoreography:
     """
     Saga chorégraphiée : pas de coordinateur central.
     Chaque service réagit aux événements et publie le suivant.
@@ -141,6 +154,10 @@ class SagaChoreography:
     Flux compensatoire (ex: échec payment) :
       COMMANDE_CREEE → STOCK_RESERVE → PAIEMENT_ECHOUE
         → inventory: STOCK_LIBERE → COMMANDE_ANNULEE
+
+    L'échec est injecté au niveau du ServiceSimule lui-même
+    (taux_echec=1.0), pas par un flag externe : chaque service ne
+    connaît que sa propre fiabilité, exactement comme en production.
     """
 
     def __init__(self, bus: BusEvenements,
@@ -151,7 +168,7 @@ class SagaChoreography:
         self.bus      = bus
         self.services = {"inventory": inventory, "payment": payment,
                          "shipment": shipment, "notif": notif}
-        self._sagas:  dict[str, dict] = {}   # saga_id → état
+        self._sagas:  dict[str, dict] = {}   # commande_id → état
         self._lock    = threading.Lock()
 
         # Câblage des handlers
@@ -163,37 +180,47 @@ class SagaChoreography:
         bus.s_abonner("EXPEDITION_CREEE",      self._on_expedition_ok)
         bus.s_abonner("EXPEDITION_ECHOUEE",    self._on_expedition_echec)
 
-    def demarrer(self, commande_id: str, articles: list, montant: float,
-                 forcer_echec_a: str = None) -> str:
+    def lancer(self, commande_id: str, produit: str, montant: float, user_id: str) -> str:
         with self._lock:
             self._sagas[commande_id] = {
                 "etat": EtatSaga.EN_COURS, "etapes": [],
-                "forcer_echec": forcer_echec_a, "montant": montant
+                "debut": time.time(), "produit": produit,
+                "montant": montant, "user_id": user_id,
             }
         self.bus.publier("COMMANDE_CREEE",
-                         {"commande_id": commande_id, "articles": articles,
-                          "montant": montant, "forcer_echec": forcer_echec_a},
+                         {"commande_id": commande_id, "produit": produit,
+                          "montant": montant, "user_id": user_id},
                          source="order-svc")
         return commande_id
 
+    def _appartient(self, commande_id: str) -> bool:
+        """Un bus peut être partagé par plusieurs managers (plusieurs saga
+        « pipelines » en parallèle) : chaque manager ne doit réagir qu'aux
+        commandes qu'il a lui-même lancées via `lancer()`."""
+        with self._lock:
+            return commande_id in self._sagas
+
     def _on_commande_creee(self, ev):
         p = ev["payload"]
-        forcer = p.get("forcer_echec") == "inventory"
+        if not self._appartient(p["commande_id"]):
+            return
         res = self.services["inventory"].executer(
-            "RESERVER_STOCK", {"articles": p["articles"]}, forcer_erreur=forcer)
+            "RESERVER_STOCK", {"produit": p["produit"]})
         self._log(p["commande_id"], "inventory", res.succes)
         if res.succes:
             self.bus.publier("STOCK_RESERVE",
                              {**p, "ref_stock": res.data["ref"]}, source="inventory-svc")
         else:
+            self._finir(p["commande_id"], EtatSaga.ECHOUEE)
             self.bus.publier("STOCK_RESERVE_ECHEC",
                              {**p, "erreur": res.erreur}, source="inventory-svc")
 
     def _on_stock_reserve(self, ev):
         p = ev["payload"]
-        forcer = p.get("forcer_echec") == "payment"
+        if not self._appartient(p["commande_id"]):
+            return
         res = self.services["payment"].executer(
-            "DEBITER_CARTE", {"montant": p["montant"]}, forcer_erreur=forcer)
+            "DEBITER_CARTE", {"montant": p["montant"]})
         self._log(p["commande_id"], "payment", res.succes)
         if res.succes:
             self.bus.publier("PAIEMENT_EFFECTUE",
@@ -204,9 +231,10 @@ class SagaChoreography:
 
     def _on_paiement_ok(self, ev):
         p = ev["payload"]
-        forcer = p.get("forcer_echec") == "shipment"
+        if not self._appartient(p["commande_id"]):
+            return
         res = self.services["shipment"].executer(
-            "CREER_EXPEDITION", {"commande_id": p["commande_id"]}, forcer_erreur=forcer)
+            "CREER_EXPEDITION", {"commande_id": p["commande_id"]})
         self._log(p["commande_id"], "shipment", res.succes)
         if res.succes:
             self.bus.publier("EXPEDITION_CREEE",
@@ -217,48 +245,51 @@ class SagaChoreography:
 
     def _on_expedition_ok(self, ev):
         p = ev["payload"]
+        if not self._appartient(p["commande_id"]):
+            return
         self.services["notif"].executer("ENVOYER_EMAIL", {"commande_id": p["commande_id"]})
         self._log(p["commande_id"], "notif", True)
-        with self._lock:
-            if p["commande_id"] in self._sagas:
-                self._sagas[p["commande_id"]]["etat"] = EtatSaga.COMPLETEE
+        self._finir(p["commande_id"], EtatSaga.SUCCES)
 
     # ── Compensations ─────────────────────────────────────────────────────────
 
     def _on_stock_echec(self, ev):
-        p = ev["payload"]
-        with self._lock:
-            if p["commande_id"] in self._sagas:
-                self._sagas[p["commande_id"]]["etat"] = EtatSaga.COMPENSEE
+        pass  # rien à compenser : c'était la première étape, déjà finalisé ci-dessus
 
     def _on_paiement_echec(self, ev):
         """Paiement échoué → libérer le stock (compensation)."""
         p = ev["payload"]
+        if not self._appartient(p["commande_id"]):
+            return
         with self._lock:
             if p["commande_id"] in self._sagas:
                 self._sagas[p["commande_id"]]["etat"] = EtatSaga.EN_COMPENSATION
-        self.services["inventory"].compenser("RESERVER_STOCK", {"articles": p.get("articles", [])})
-        with self._lock:
-            if p["commande_id"] in self._sagas:
-                self._sagas[p["commande_id"]]["etat"] = EtatSaga.COMPENSEE
+        self.services["inventory"].compenser("RESERVER_STOCK", {"produit": p.get("produit", "")})
+        self._finir(p["commande_id"], EtatSaga.COMPENSEE)
 
     def _on_expedition_echec(self, ev):
         """Expédition échouée → rembourser + libérer stock."""
         p = ev["payload"]
+        if not self._appartient(p["commande_id"]):
+            return
         with self._lock:
             if p["commande_id"] in self._sagas:
                 self._sagas[p["commande_id"]]["etat"] = EtatSaga.EN_COMPENSATION
         self.services["payment"].compenser("DEBITER_CARTE", {"montant": p.get("montant", 0)})
-        self.services["inventory"].compenser("RESERVER_STOCK", {"articles": p.get("articles", [])})
-        with self._lock:
-            if p["commande_id"] in self._sagas:
-                self._sagas[p["commande_id"]]["etat"] = EtatSaga.COMPENSEE
+        self.services["inventory"].compenser("RESERVER_STOCK", {"produit": p.get("produit", "")})
+        self._finir(p["commande_id"], EtatSaga.COMPENSEE)
 
-    def _log(self, commande_id: str, service: str, ok: bool):
+    def _log(self, commande_id: str, service: str, succes: bool):
         with self._lock:
             if commande_id in self._sagas:
                 self._sagas[commande_id]["etapes"].append(
-                    {"service": service, "ok": ok, "ts": time.time()})
+                    {"etape": service, "succes": succes})
+
+    def _finir(self, commande_id: str, etat_final: EtatSaga):
+        with self._lock:
+            if commande_id in self._sagas:
+                self._sagas[commande_id]["etat"] = etat_final
+                self._sagas[commande_id]["fin"] = time.time()
 
     def etat(self, commande_id: str) -> dict:
         with self._lock:
@@ -271,12 +302,11 @@ class SagaChoreography:
 
 @dataclass
 class EtapeSaga:
-    """Une étape dans la séquence orchestrée."""
-    nom:         str
-    service:     str
-    commande:    str
-    params_fn:   Callable[[dict], dict]   # construit les params depuis le contexte
-    compenser_fn: Optional[Callable[[dict], tuple[str, dict]]] = None
+    """Une étape dans la séquence orchestrée, avec sa compensation."""
+    nom:          str
+    service:      ServiceSimule
+    commande:     str
+    compensation: Optional[str] = None   # nom de l'action compensatoire, ou None
 
 
 class SagaOrchestrator:
@@ -288,66 +318,67 @@ class SagaOrchestrator:
     visible en un seul endroit. Chaque étape est explicitement
     définie avec sa compensation.
 
-    En production : l'état de la saga est persistent (base de données)
+    En production : l'état de la saga est persistant (base de données)
     pour survivre aux redémarrages. Les étapes sont idempotentes.
     """
 
-    def __init__(self, nom: str, etapes: list[EtapeSaga],
-                 services: dict[str, ServiceSimule]):
-        self.nom      = nom
-        self.etapes   = etapes
-        self.services = services
+    def __init__(self, saga_id: str, etapes: list[EtapeSaga]):
+        self.saga_id = saga_id
+        self.etapes  = etapes
+        self.journal: list[dict] = []
+        self.debut:   Optional[float] = None
+        self.fin:     Optional[float] = None
 
-    def executer(self, contexte: dict,
-                 forcer_echec_a: str = None) -> dict:
+    def executer(self, payload: dict) -> bool:
         """
         Exécute la saga séquentiellement.
-        Retourne le résultat avec l'état final et les compensations effectuées.
+        Retourne True si toutes les étapes ont réussi, False sinon
+        (auquel cas les compensations ont déjà été exécutées).
         """
-        saga_id      = uuid.uuid4().hex[:8]
-        ctx          = dict(contexte)
-        etapes_ok:   list[EtapeSaga] = []
-        journal      = []
+        self.debut = time.time()
+        ctx = dict(payload)
+        etapes_ok: list[EtapeSaga] = []
 
-        print(f"\n  ── Saga {self.nom} [{saga_id}] démarré ──")
+        print(f"\n  ── Saga [{self.saga_id}] démarrée ──")
 
         for etape in self.etapes:
-            params      = etape.params_fn(ctx)
-            forcer      = (forcer_echec_a == etape.service)
-            svc         = self.services[etape.service]
-
             t0  = time.perf_counter()
-            res = svc.executer(etape.commande, params, forcer_erreur=forcer)
+            res = etape.service.executer(etape.commande, ctx)
             dt  = (time.perf_counter() - t0) * 1000
 
             icone = "✅" if res.succes else "❌"
-            print(f"  {icone} {etape.service:<14} {etape.commande:<22} {dt:>6.0f}ms"
-                  + (f"  ref={res.data.get('ref','')[:6]}" if res.succes else f"  {res.erreur}"))
+            print(f"  {icone} {etape.service.nom:<14} {etape.commande:<22} {dt:>6.0f}ms"
+                  + (f"  ref={res.data.get('ref', '')[:6]}" if res.succes else f"  {res.erreur}"))
 
-            journal.append({"etape": etape.nom, "service": etape.service,
-                             "ok": res.succes, "duree_ms": dt})
+            self.journal.append({"etape": etape.nom, "service": etape.service.nom,
+                                  "ok": res.succes, "duree_ms": dt})
 
             if res.succes:
                 ctx.update(res.data)
                 etapes_ok.append(etape)
             else:
-                # Compensation dans l'ordre inverse
-                print(f"\n  ⟳ Compensation (ordre inverse) :")
-                compensations = []
+                if etapes_ok:
+                    print(f"\n  ⟳ Compensation (ordre inverse) :")
                 for etape_a_comp in reversed(etapes_ok):
-                    if etape_a_comp.compenser_fn is None:
+                    if etape_a_comp.compensation is None:
                         continue
-                    svc_comp, params_comp = etape_a_comp.compenser_fn(ctx)
                     t0c = time.perf_counter()
-                    self.services[svc_comp].compenser(etape_a_comp.commande, params_comp)
+                    etape_a_comp.service.compenser(etape_a_comp.commande, ctx)
                     dtc = (time.perf_counter() - t0c) * 1000
-                    print(f"  ↩  {svc_comp:<14} COMPENSER_{etape_a_comp.commande:<16} {dtc:>5.0f}ms")
-                    compensations.append(svc_comp)
-
-                return {"saga_id": saga_id, "etat": EtatSaga.COMPENSEE,
-                        "journal": journal, "compensations": compensations,
-                        "echec_a": etape.service}
+                    print(f"  ↩  {etape_a_comp.service.nom:<14} {etape_a_comp.compensation:<22} {dtc:>5.0f}ms")
+                    self.journal.append({"etape": f"{etape_a_comp.compensation} (compensation)",
+                                          "service": etape_a_comp.service.nom,
+                                          "ok": True, "duree_ms": dtc})
+                self.fin = time.time()
+                return False
 
         print(f"  ✅ Saga terminée avec succès")
-        return {"saga_id": saga_id, "etat": EtatSaga.COMPLETEE,
-                "journal": journal, "compensations": [], "ctx": ctx}
+        self.fin = time.time()
+        return True
+
+    def afficher(self):
+        print(f"\n  ── Journal saga {self.saga_id} ({len(self.journal)} entrées) ──")
+        for e in self.journal:
+            icone = "✅" if e["ok"] and "(compensation)" not in e["etape"] else \
+                    "↩️ " if "(compensation)" in e["etape"] else "❌"
+            print(f"    {icone} {e['etape']}  ({e['duree_ms']:.0f}ms)")
