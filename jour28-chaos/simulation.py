@@ -1,8 +1,6 @@
 
 import time, random
 from collections import defaultdict
-import sys
-sys.path.insert(0, "/home/claude/jour28-chaos")
 from chaos import (InjecteurPanne, Service, TypePanne, ExperienceChaos,
                    MoteurChaos, SLO, MoniteurSLO, ServiceException)
 

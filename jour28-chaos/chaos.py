@@ -1,10 +1,20 @@
-"""Jour 28 - Chaos Engineering core"""
+"""Jour 28 - Chaos Engineering core
+
+Vocabulaire :
+  Steady State    : comportement normal mesurable (taux erreur, latence P99)
+  Blast Radius    : périmètre de l'expérience (1 service, X% du trafic, tout)
+  Abort Condition : seuil au-delà duquel l'expérience doit s'arrêter
+  Game Day        : session intensive d'injections multiples
+
+Flux : Hypothèse -> Injection -> Mesure -> Comparaison au SLO -> Correctif
+"""
 from __future__ import annotations
-import time, random, threading
+import time, random, threading, operator, statistics
 from dataclasses import dataclass, field
-from typing import Any, Optional, Callable
+from typing import Optional, Callable, Any
 from collections import defaultdict
 from enum import Enum
+
 
 class TypePanne(Enum):
     LATENCE      = "latence"
@@ -12,211 +22,261 @@ class TypePanne(Enum):
     CRASH        = "crash"
     PERTE_PAQUET = "perte_paquet"
 
-@dataclass
-class ConfigPanne:
-    type:        TypePanne
-    cible:       str
-    intensite:   float
-    duree_s:     float
-    latence_ms:  float = 0.0
-    code_erreur: int   = 500
-    description: str   = ""
 
-@dataclass
-class MetriquesService:
-    service:        str
-    requetes_total: int  = 0
-    requetes_ok:    int  = 0
-    requetes_err:   int  = 0
-    latences_ms:    list = field(default_factory=list)
-    periodes:       list = field(default_factory=list)
+class ServiceException(Exception):
+    """Levée par Service.appeler() quand l'appel échoue (panne injectée ou nominale)."""
+    def __init__(self, service: str, status: int, message: str):
+        super().__init__(f"{service}: {message} (status={status})")
+        self.service = service
+        self.status  = status
+        self.message = message
 
-    @property
-    def taux_erreur(self):
-        return (self.requetes_err / max(self.requetes_total, 1)) * 100
 
-    @property
-    def disponibilite(self):
-        return 100.0 - self.taux_erreur
+# ─── INJECTEUR DE PANNES ──────────────────────────────────────────────────────
 
-    @property
-    def latence_p99(self):
-        if not self.latences_ms: return 0.0
-        s = sorted(self.latences_ms)
-        return s[min(int(len(s)*0.99), len(s)-1)]
+class InjecteurPanne:
+    """
+    Registre central des pannes actives, par service cible.
+    Un Service consulte l'injecteur à chaque appel pour savoir s'il doit
+    se comporter anormalement — exactement comme un proxy/sidecar en
+    production (ex: Envoy fault injection, Chaos Mesh).
+    """
+    def __init__(self):
+        self._pannes: dict[str, dict] = {}
+        self._stats  = defaultdict(int)
+        self._lock   = threading.Lock()
 
-    def snapshot(self, label):
-        self.periodes.append({"label": label,
-            "taux_erreur": round(self.taux_erreur, 2),
-            "dispo": round(self.disponibilite, 2),
-            "p99_ms": round(self.latence_p99, 2),
-            "total": self.requetes_total})
+    def injecter(self, cible: str, type_panne: TypePanne, probabilite: float, **params):
+        with self._lock:
+            self._pannes[cible] = {"type": type_panne, "probabilite": probabilite, **params}
 
-    def reset(self):
-        self.requetes_total = self.requetes_ok = self.requetes_err = 0
-        self.latences_ms = []
+    def effacer(self, cible: Optional[str] = None):
+        with self._lock:
+            if cible is None:
+                self._pannes.clear()
+            else:
+                self._pannes.pop(cible, None)
+
+    def tirer(self, cible: str) -> Optional[dict]:
+        """Décide si la panne configurée pour `cible` se déclenche cette fois-ci."""
+        with self._lock:
+            cfg = self._pannes.get(cible)
+        if cfg is None:
+            return None
+        if random.random() < cfg["probabilite"]:
+            with self._lock:
+                self._stats[f"{cible}:{cfg['type'].value}"] += 1
+            return cfg
+        return None
+
+    def stats(self) -> dict:
+        with self._lock:
+            return dict(self._stats)
+
+
+# ─── SERVICE SIMULÉ (avec auto-surveillance type circuit breaker) ────────────
 
 class Service:
-    def __init__(self, nom, base_latence_ms=20.0, taux_erreur_nominal_pct=0.5):
-        self.nom = nom
-        self._base = base_latence_ms
+    """
+    Simule un microservice avec latence nominale, un petit taux d'erreur
+    "naturel", et une sensibilité aux pannes injectées via un InjecteurPanne
+    partagé.
+
+    Chaque service surveille son propre taux d'échec récent (fenêtre
+    glissante) et expose `cb_ouvert` dans `stats()` — mais NE bloque PAS
+    les appels lui-même : c'est un indicateur, pas une protection. La leçon
+    du GameDay (jour 28) est justement que ce service n'a PAS de vrai
+    circuit breaker branché (cf. jour 21 pour l'implémentation qui, elle,
+    coupe réellement les appels).
+    """
+    FENETRE_CB = 10
+    SEUIL_CB_PCT = 50.0
+
+    def __init__(self, nom: str, injecteur: InjecteurPanne,
+                 latence_nominale_ms: float = 20.0, taux_erreur_nominal_pct: float = 0.5):
+        self.nom        = nom
+        self._injecteur = injecteur
+        self._base       = latence_nominale_ms
         self._nominal_err = taux_erreur_nominal_pct
-        self._panne = None
-        self._lock = threading.Lock()
-        self._en_vie = True
-        self.metriques = MetriquesService(nom)
+        self._lock       = threading.Lock()
+        self._total      = 0
+        self._echecs     = 0
+        self._fenetre: list[bool] = []   # historique récent (True = succès)
 
-    def injecter(self, cfg):
+    def appeler(self, action: str = "default") -> dict:
         with self._lock:
-            self._panne = cfg
-            self._en_vie = (cfg.type != TypePanne.CRASH)
+            self._total += 1
 
-    def retirer(self):
+        panne = self._injecteur.tirer(self.nom)
+
+        if panne and panne["type"] == TypePanne.CRASH:
+            self._enregistrer(False)
+            raise ServiceException(self.nom, 503, f"{self.nom} indisponible (crash)")
+
+        base_ms  = max(0.5, random.gauss(self._base, self._base * 0.15))
+        extra_ms = panne.get("ms", 0.0) if panne and panne["type"] == TypePanne.LATENCE else 0.0
+        time.sleep((base_ms + extra_ms) / 1000)
+
+        if panne and panne["type"] == TypePanne.ERREUR:
+            self._enregistrer(False)
+            raise ServiceException(self.nom, panne.get("code", 500),
+                                    panne.get("message", "erreur injectée"))
+
+        if panne and panne["type"] == TypePanne.PERTE_PAQUET:
+            self._enregistrer(False)
+            raise ServiceException(self.nom, 0, "paquet perdu")
+
+        if random.random() < self._nominal_err / 100:
+            self._enregistrer(False)
+            raise ServiceException(self.nom, 500, "erreur transitoire")
+
+        self._enregistrer(True)
+        return {"ok": True, "action": action, "latence_ms": base_ms + extra_ms}
+
+    def _enregistrer(self, succes: bool):
         with self._lock:
-            self._panne = None
-            self._en_vie = True
+            if not succes:
+                self._echecs += 1
+            self._fenetre.append(succes)
+            if len(self._fenetre) > self.FENETRE_CB:
+                self._fenetre.pop(0)
 
-    def appeler(self):
-        t0 = time.perf_counter()
+    def stats(self) -> dict:
         with self._lock:
-            en_vie = self._en_vie
-            panne = self._panne
+            total, echecs, fenetre = self._total, self._echecs, list(self._fenetre)
+        taux_fenetre = (fenetre.count(False) / len(fenetre) * 100) if fenetre else 0.0
+        return {
+            "total": total,
+            "echec": echecs,
+            "taux_echec": round((echecs / max(total, 1)) * 100, 1),
+            "cb_ouvert": len(fenetre) >= self.FENETRE_CB and taux_fenetre >= self.SEUIL_CB_PCT,
+        }
 
-        if not en_vie:
-            ms = (time.perf_counter()-t0)*1000 + 1.0
-            self._rec(False, ms)
-            return {"ok": False, "status": 503, "erreur": f"{self.nom} crashe"}
 
-        base_ms = max(0.5, random.gauss(self._base, self._base*0.15))
+# ─── SLO ──────────────────────────────────────────────────────────────────────
 
-        if panne and random.random() < panne.intensite:
-            if panne.type == TypePanne.LATENCE:
-                time.sleep((base_ms + panne.latence_ms)/1000)
-                ms = (time.perf_counter()-t0)*1000
-                ok = ms < 3000
-                self._rec(ok, ms)
-                return ({"ok": True, "status": 200, "latence_ms": ms} if ok
-                        else {"ok": False, "status": 504, "erreur": f"Timeout {ms:.0f}ms"})
-            elif panne.type == TypePanne.ERREUR:
-                time.sleep(base_ms/1000)
-                ms = (time.perf_counter()-t0)*1000
-                self._rec(False, ms)
-                return {"ok": False, "status": panne.code_erreur, "erreur": f"Erreur {panne.code_erreur}"}
-            elif panne.type == TypePanne.PERTE_PAQUET:
-                ms = (time.perf_counter()-t0)*1000 + 0.5
-                self._rec(False, ms)
-                return {"ok": False, "status": 0, "erreur": "Paquet perdu"}
+_OPERATEURS = {"<": operator.lt, "<=": operator.le, ">": operator.gt,
+               ">=": operator.ge, "==": operator.eq}
 
-        if random.random() < self._nominal_err/100:
-            time.sleep(base_ms/1000)
-            ms = (time.perf_counter()-t0)*1000
-            self._rec(False, ms)
-            return {"ok": False, "status": 500, "erreur": "Erreur transitoire"}
 
-        time.sleep(base_ms/1000)
-        ms = (time.perf_counter()-t0)*1000
-        self._rec(True, ms)
-        return {"ok": True, "status": 200, "latence_ms": ms}
+@dataclass
+class SLO:
+    """Service Level Objective : une métrique doit rester du bon côté d'un seuil."""
+    nom:       str
+    metrique:  str          # clé à lire dans le dict de mesures (ex: "latence_p99_ms")
+    seuil:     float
+    operateur: str = "<"
 
-    def _rec(self, ok, ms):
-        m = self.metriques
-        m.requetes_total += 1
-        m.requetes_ok += int(ok)
-        m.requetes_err += int(not ok)
-        m.latences_ms.append(ms)
+    def evaluer(self, valeur: float) -> bool:
+        return _OPERATEURS[self.operateur](valeur, self.seuil)
 
-class CircuitBreaker:
-    class Etat(Enum):
-        CLOSED    = "CLOSED"
-        OPEN      = "OPEN"
-        HALF_OPEN = "HALF_OPEN"
 
-    def __init__(self, svc, seuil_pct=50.0, fenetre=10, timeout_s=1.5):
-        self._svc = svc
-        self._seuil = seuil_pct
-        self._fenetre = fenetre
-        self._timeout = timeout_s
-        self._etat = self.Etat.CLOSED
-        self._resultats = []
-        self._ouvert_a = 0.0
-        self._stats = defaultdict(int)
+class MoniteurSLO:
+    """Évalue un ensemble de SLOs contre une mesure et rapporte les violations."""
+    def __init__(self, slos: list[SLO]):
+        self.slos = slos
 
-    @property
-    def etat(self):
-        return self._etat.value
+    def violations(self, metriques: dict) -> list[str]:
+        out = []
+        for slo in self.slos:
+            valeur = metriques.get(slo.metrique, 0)
+            if not slo.evaluer(valeur):
+                out.append(f"{slo.nom} : {valeur} viole le seuil ({slo.operateur} {slo.seuil})")
+        return out
 
-    def appeler(self):
-        if self._etat == self.Etat.OPEN:
-            if time.time() - self._ouvert_a > self._timeout:
-                self._etat = self.Etat.HALF_OPEN
-            else:
-                self._stats["court_circuit"] += 1
-                return {"ok": False, "status": 503, "erreur": "Circuit ouvert"}
-        rep = self._svc.appeler()
-        self._resultats.append(rep["ok"])
-        if len(self._resultats) > self._fenetre:
-            self._resultats.pop(0)
-        if self._etat == self.Etat.HALF_OPEN:
-            if rep["ok"]:
-                self._etat = self.Etat.CLOSED
-                self._stats["fermetures"] += 1
-            else:
-                self._etat = self.Etat.OPEN
-                self._ouvert_a = time.time()
-        elif len(self._resultats) >= self._fenetre:
-            taux = self._resultats.count(False)/len(self._resultats)*100
-            if taux >= self._seuil:
-                self._etat = self.Etat.OPEN
-                self._ouvert_a = time.time()
-                self._stats["ouvertures"] += 1
-        return rep
+    def tous_ok(self, metriques: dict) -> bool:
+        return not self.violations(metriques)
 
-    def stats(self):
-        return {**dict(self._stats), "etat": self._etat.value}
 
-class InjecteurChaos:
-    def __init__(self, services):
-        self._services = services
-        self._historique = []
+# ─── EXPÉRIENCE & MOTEUR DE CHAOS ─────────────────────────────────────────────
 
-    def mesurer(self, nb, label):
-        for svc in self._services.values():
-            svc.metriques.reset()
-        for _ in range(nb):
-            for svc in self._services.values():
-                svc.appeler()
-        res = {}
-        for nom, svc in self._services.items():
-            svc.metriques.snapshot(label)
-            res[nom] = {"taux_erreur": round(svc.metriques.taux_erreur,2),
-                        "dispo": round(svc.metriques.disponibilite,2),
-                        "p99_ms": round(svc.metriques.latence_p99,2)}
-        return res
+@dataclass
+class ExperienceChaos:
+    """Hypothèse + configuration d'une expérience de chaos engineering."""
+    nom:         str
+    hypothese:   str
+    cible:       str
+    type_panne:  TypePanne
+    probabilite: float
+    parametres:  dict = field(default_factory=dict)
 
-    def experiment(self, cfg, nb=80, abort_pct=80.0):
-        cible = self._services.get(cfg.cible)
-        if not cible:
-            return {"erreur": f"Service inconnu: {cfg.cible}"}
-        baseline = self.mesurer(nb, "baseline")
-        cible.injecter(cfg)
-        for svc in self._services.values():
-            svc.metriques.reset()
-        aborted = False
-        for i in range(nb):
-            for svc in self._services.values():
-                svc.appeler()
-            if i == 25 and cible.metriques.taux_erreur > abort_pct:
-                aborted = True
-                break
-        sous_panne = {}
-        for nom, svc in self._services.items():
-            svc.metriques.snapshot("sous_panne")
-            sous_panne[nom] = {"taux_erreur": round(svc.metriques.taux_erreur,2),
-                                "dispo": round(svc.metriques.disponibilite,2),
-                                "p99_ms": round(svc.metriques.latence_p99,2)}
-        cible.retirer()
-        apres = self.mesurer(nb, "recuperation")
-        res = {"panne": cfg, "aborted": aborted,
-               "baseline": baseline, "sous_panne": sous_panne, "apres": apres}
-        self._historique.append(res)
-        return res
+
+@dataclass
+class ResultatExperience:
+    experience:     ExperienceChaos
+    metriques:      dict            # {"baseline": {...}, "sous_panne": {...}}
+    incidents:      list
+    hypothese_ok:   bool
+    recommendation: str
+
+
+class MoteurChaos:
+    """
+    Exécute le cycle Hypothèse -> Injection -> Mesure -> Verdict.
+    Les requêtes sont envoyées en concurrence (comme un vrai test de charge)
+    pour que la latence simulée par service n'accumule pas en temps réel.
+    """
+    def __init__(self, injecteur: InjecteurPanne):
+        self._injecteur = injecteur
+
+    def _mesurer(self, charge_fn: Callable[[], Any], nb_requetes: int) -> dict:
+        latences: list[float] = []
+        echecs = 0
+        lock = threading.Lock()
+
+        def une_requete():
+            nonlocal echecs
+            t0 = time.perf_counter()
+            ok = True
+            try:
+                charge_fn()
+            except ServiceException:
+                ok = False
+            dt = (time.perf_counter() - t0) * 1000
+            with lock:
+                latences.append(dt)
+                if not ok:
+                    echecs += 1
+
+        threads = [threading.Thread(target=une_requete) for _ in range(nb_requetes)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        latences_triees = sorted(latences)
+        p99 = latences_triees[min(int(len(latences_triees) * 0.99), len(latences_triees) - 1)] \
+              if latences_triees else 0.0
+
+        return {
+            "taux_erreur":     round(echecs / max(nb_requetes, 1) * 100, 1),
+            "latence_moy_ms":  round(statistics.mean(latences), 1) if latences else 0.0,
+            "latence_p99_ms":  round(p99, 1),
+        }
+
+    def executer(self, experience: ExperienceChaos, charge_fn: Callable[[], Any],
+                 slos: list[SLO], nb_requetes: int = 40) -> ResultatExperience:
+        self._injecteur.effacer()
+        baseline = self._mesurer(charge_fn, nb_requetes)
+
+        self._injecteur.injecter(experience.cible, experience.type_panne,
+                                  experience.probabilite, **experience.parametres)
+        sous_panne = self._mesurer(charge_fn, nb_requetes)
+        self._injecteur.effacer(experience.cible)
+
+        moniteur = MoniteurSLO(slos)
+        incidents = moniteur.violations(sous_panne)
+        hypothese_ok = not incidents
+
+        recommendation = (
+            f"Hypothèse « {experience.hypothese} » confirmée : SLOs tenus sous panne."
+            if hypothese_ok else
+            f"Hypothèse « {experience.hypothese} » réfutée : {len(incidents)} SLO(s) violé(s) "
+            f"→ faiblesse à corriger avant production."
+        )
+
+        return ResultatExperience(
+            experience=experience,
+            metriques={"baseline": baseline, "sous_panne": sous_panne},
+            incidents=incidents,
+            hypothese_ok=hypothese_ok,
+            recommendation=recommendation,
+        )
